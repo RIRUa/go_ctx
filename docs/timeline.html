@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>context.Deadline 挙動の可視化 — 親処理 / 子処理タイムライン</title>
+<style>
+  :root{
+    --parent:#3b82f6; --parent-bg:#dbeafe;
+    --child:#22c55e;  --child-bg:#dcfce7;
+    --fallback:#14b8a6; --fallback-bg:#ccfbf1;
+    --ghost:#cbd5e1;
+    --deadline:#f59e0b; --cancel:#ef4444; --done:#16a34a; --respond:#7c3aed;
+    --ink:#1e293b; --muted:#64748b; --line:#e2e8f0; --card:#ffffff; --bg:#f1f5f9;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+    line-height:1.6;padding:0 0 60px}
+  header{background:#0f172a;color:#fff;padding:28px 24px}
+  header h1{margin:0 0 6px;font-size:20px}
+  header p{margin:0;color:#94a3b8;font-size:13px}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 20px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:16px;font-size:12px;color:#cbd5e1}
+  .legend .item{display:flex;align-items:center;gap:6px}
+  .sw{width:22px;height:10px;border-radius:3px;display:inline-block}
+  .gl{font-size:14px;width:16px;text-align:center;display:inline-block}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:20px 22px;margin:22px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .card h2{margin:0 0 2px;font-size:16px}
+  .card .sub{margin:0 0 16px;color:var(--muted);font-size:13px}
+  .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;
+    vertical-align:middle;margin-left:8px}
+  .badge.ok{background:var(--child-bg);color:#15803d}
+  .badge.warn{background:#fef3c7;color:#b45309}
+  .badge.bad{background:#fee2e2;color:#b91c1c}
+
+  .chart{margin:6px 0 4px}
+  .axis{position:relative;height:20px;margin-left:120px;border-bottom:1px solid var(--line)}
+  .tick{position:absolute;top:0;transform:translateX(-50%);font-size:11px;color:var(--muted)}
+  .tick::after{content:"";position:absolute;left:50%;top:18px;width:1px;height:6px;background:var(--line)}
+  .lane{display:flex;align-items:center;margin-top:14px}
+  .lane-name{width:120px;flex:0 0 120px;font-size:13px;font-weight:600;padding-right:10px}
+  .lane-name small{display:block;font-weight:400;color:var(--muted);font-size:11px}
+  .track{position:relative;flex:1;height:34px;background:#f8fafc;
+    border:1px solid var(--line);border-radius:7px;
+    background-image:repeating-linear-gradient(90deg,transparent,transparent calc(20% - 1px),var(--line) 20%)}
+  .seg{position:absolute;top:5px;height:24px;border-radius:5px;display:flex;align-items:center;
+    justify-content:center;font-size:11px;color:#fff;white-space:nowrap;overflow:hidden;padding:0 6px}
+  .seg.ghost{background:repeating-linear-gradient(45deg,#f1f5f9,#f1f5f9 5px,#e2e8f0 5px,#e2e8f0 10px);
+    color:var(--muted);border:1px dashed var(--ghost)}
+  .mk{position:absolute;top:-3px;height:40px;width:0;border-left:2px dashed transparent;transform:translateX(-1px)}
+  .mk .glyph{position:absolute;top:-17px;left:50%;transform:translateX(-50%);font-size:15px;line-height:1}
+  .mk.deadline{border-left-color:var(--deadline)} .mk.deadline .glyph{color:var(--deadline)}
+  .mk.cancel{border-left-color:var(--cancel)} .mk.cancel .glyph{color:var(--cancel)}
+  .mk.done .glyph{color:var(--done)} .mk.respond .glyph{color:var(--respond)}
+
+  .events{margin:16px 0 0;padding:12px 14px;background:#f8fafc;border-radius:8px;font-size:13px}
+  .events ul{margin:0;padding-left:2px;list-style:none}
+  .events li{display:flex;gap:8px;align-items:baseline;padding:2px 0}
+  .events .t{flex:0 0 64px;color:var(--muted);font-variant-numeric:tabular-nums;text-align:right}
+  .events .g{flex:0 0 16px;text-align:center}
+  .note{margin:12px 0 0;font-size:13px;color:#334155;border-left:3px solid var(--parent);padding-left:12px}
+  .takeaway{background:#0f172a;color:#e2e8f0;border-radius:12px;padding:18px 22px;margin:22px 0;font-size:13px}
+  .takeaway h2{color:#fff;font-size:15px;margin:0 0 10px}
+  .takeaway b{color:#7dd3fc}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>context.Deadline の挙動 — 親(サーバー) / 子(ES) タイムライン</h1>
+    <p>横軸＝時間。親 context と、その下で ES を呼ぶ子 context が、いつ・なぜ打ち切られるかを可視化。</p>
+    <div class="legend">
+      <span class="item"><span class="sw" style="background:var(--parent)"></span>親(サーバー)処理</span>
+      <span class="item"><span class="sw" style="background:var(--child)"></span>子(ES)処理</span>
+      <span class="item"><span class="sw" style="background:var(--fallback)"></span>フォールバック</span>
+      <span class="item"><span class="sw ghost-sw" style="background:repeating-linear-gradient(45deg,#475569,#475569 4px,#334155 4px,#334155 8px)"></span>本来の処理(打ち切られた分)</span>
+      <span class="item"><span class="gl" style="color:var(--deadline)">▼</span>deadline</span>
+      <span class="item"><span class="gl" style="color:var(--cancel)">✕</span>cancel/中断</span>
+      <span class="item"><span class="gl" style="color:var(--done)">●</span>完了</span>
+      <span class="item"><span class="gl" style="color:var(--respond)">◆</span>応答</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap" id="root"></main>
+
+<script>
+const AXIS = 550; // ms
+const ticks = [0,100,200,300,400,500];
+
+const scenarios = [
+  {
+    title:"パターン1 — 子(ES)が timeout、親(サーバー)は生存",
+    sub:"派生: esCtx = WithTimeout(serverCtx, 100ms) / サーバー予算500ms / ES応答は本来300ms",
+    badge:{cls:"ok",text:"フォールバック成功"},
+    lanes:[
+      {name:"親 (サーバー)", note:"予算 500ms",
+       segs:[{s:0,e:500,c:"parent",label:"リクエスト処理 (予算500ms)"}],
+       marks:[{t:130,kind:"respond"},{t:500,kind:"deadline",faded:true}]},
+      {name:"子 (ES)", note:"個別 100ms",
+       segs:[{s:0,e:100,c:"child",label:"ES検索"},
+             {s:100,e:300,c:"ghost",label:"本来の完了(300ms)"},
+             {s:100,e:130,c:"fallback",label:"fallback"}],
+       marks:[{t:100,kind:"cancel"},{t:130,kind:"done"}]}
+    ],
+    events:[
+      {t:"100ms",g:"✕",gc:"cancel",x:"ES個別予算(100ms)超過 → <b>ErrBudgetExceeded</b>。だが親はまだ生存"},
+      {t:"100–130ms",g:"●",gc:"done",x:"親が生きているのでフォールバック検索を実行 → 成功"},
+      {t:"130ms",g:"◆",gc:"respond",x:"degraded な結果でクライアントへ応答"}
+    ],
+    note:"子の打ち切りは親へ伝播しない。親(serverCtx)はそのまま使えるので、フォールバックや部分応答に進める。"
+  },
+  {
+    title:"パターン1 — 親(サーバー)の予算切れ、子も巻き込まれて停止",
+    sub:"派生: サーバー予算80ms / ES個別予算500ms / ES応答は本来300ms",
+    badge:{cls:"bad",text:"全体タイムアウト"},
+    lanes:[
+      {name:"親 (サーバー)", note:"予算 80ms",
+       segs:[{s:0,e:80,c:"parent",label:"処理"}],
+       marks:[{t:80,kind:"deadline"}]},
+      {name:"子 (ES)", note:"個別 500ms",
+       segs:[{s:0,e:80,c:"child",label:"ES検索"},
+             {s:80,e:300,c:"ghost",label:"本来の完了(300ms)"}],
+       marks:[{t:80,kind:"cancel"}]}
+    ],
+    events:[
+      {t:"80ms",g:"▼",gc:"deadline",x:"親の deadline 到達。親→子へ伝播"},
+      {t:"80ms",g:"✕",gc:"cancel",x:"子も中断 → <b>DeadlineExceeded(親由来)</b>。フォールバックも親由来なので不可"}
+    ],
+    note:"親が死ねば子も死ぬ(親→子は伝播)。子に500msの余裕を与えても、親の80msが頭打ちになる。"
+  },
+  {
+    title:"パターン2 — 独立 context にサーバー timeout を一方向伝播(サーバーが先)",
+    sub:"独立: esCtx は Background から生成 + AfterFunc で serverCtx.Done を伝播 / サーバー80ms / ES個別500ms",
+    badge:{cls:"bad",text:"パターン1と同結果"},
+    lanes:[
+      {name:"親 (サーバー)", note:"予算 80ms",
+       segs:[{s:0,e:80,c:"parent",label:"処理"}],
+       marks:[{t:80,kind:"deadline"}]},
+      {name:"子 (ES)", note:"独立/個別500ms",
+       segs:[{s:0,e:80,c:"child",label:"ES検索"},
+             {s:80,e:300,c:"ghost",label:"本来の完了(300ms)"}],
+       marks:[{t:80,kind:"cancel"},{t:500,kind:"deadline",faded:true}]}
+    ],
+    events:[
+      {t:"80ms",g:"▼",gc:"deadline",x:"親の deadline 到達"},
+      {t:"80ms",g:"✕",gc:"cancel",x:"AfterFunc が serverCtx.Done を検知し esCtx を cancel → 中断"},
+      {t:"(500ms)",g:"▼",gc:"deadline",x:"ES個別予算の deadline。<b>到達せず</b>。ただし ctx.Deadline() はこの500msを指し続ける(=実害になりうるズレ)"}
+    ],
+    note:"打ち切り時刻も原因もパターン1と同一。違いは ctx.Deadline() が独立予算(500ms)のままで、実I/Oの read deadline を過大設定しうる点。"
+  },
+  {
+    title:"パターン2 — ES個別予算が先に切れる(サーバーは無傷)",
+    sub:"独立: サーバー予算500ms / ES個別80ms / ES応答は本来300ms",
+    badge:{cls:"warn",text:"ESのみ中断"},
+    lanes:[
+      {name:"親 (サーバー)", note:"予算 500ms",
+       segs:[{s:0,e:500,c:"parent",label:"リクエスト処理 (予算500ms)"}],
+       marks:[{t:500,kind:"deadline",faded:true}]},
+      {name:"子 (ES)", note:"独立/個別80ms",
+       segs:[{s:0,e:80,c:"child",label:"ES検索"},
+             {s:80,e:300,c:"ghost",label:"本来の完了(300ms)"}],
+       marks:[{t:80,kind:"cancel"}]}
+    ],
+    events:[
+      {t:"80ms",g:"✕",gc:"cancel",x:"ES個別予算超過 → <b>ErrBudgetExceeded</b>。独立 root に閉じる"},
+      {t:"80ms→",g:"●",gc:"done",x:"サーバーは無傷で処理継続(フォールバック可)"}
+    ],
+    note:"子→親は伝播しない。結果はパターン1の『子timeout』ケースと同じ。"
+  },
+  {
+    title:"補足 — deadline ではなく強制 cancel(クライアント切断 / サーバー停止)",
+    sub:"予算は十分(個別500ms)。50ms 時点で cancel() が呼ばれる(deadline ではない)",
+    badge:{cls:"bad",text:"フォールバックしない"},
+    lanes:[
+      {name:"親 (サーバー)", note:"cancel()",
+       segs:[{s:0,e:50,c:"parent",label:"処理"}],
+       marks:[{t:50,kind:"cancel"}]},
+      {name:"子 (ES)", note:"個別500ms",
+       segs:[{s:0,e:50,c:"child",label:"ES検索"},
+             {s:50,e:300,c:"ghost",label:"本来の完了(300ms)"}],
+       marks:[{t:50,kind:"cancel"}]}
+    ],
+    events:[
+      {t:"50ms",g:"✕",gc:"cancel",x:"クライアント切断などで cancel() → 親が Done(deadline ではない)"},
+      {t:"50ms",g:"✕",gc:"cancel",x:"子へ伝播 → <b>Canceled</b>。timeout 系と errors.Is で区別できる"},
+      {t:"after",g:"●",gc:"done",x:"誰も結果を待っていないので<b>フォールバックせず即終了</b>"}
+    ],
+    note:"強制 cancel も両パターンで子へ伝播。原因が Canceled になる点が timeout と違い、『去ったクライアントに無駄なクエリを投げない』判断に使える。"
+  }
+];
+
+const root = document.getElementById('root');
+const pct = t => (t/AXIS*100);
+
+function laneHTML(lane){
+  const segs = lane.segs.map(sg=>{
+    const left=pct(sg.s), w=pct(sg.e)-pct(sg.s);
+    const cls = sg.c==='ghost' ? 'seg ghost' : 'seg';
+    const bg = sg.c==='ghost' ? '' :
+      `background:var(--${sg.c});`;
+    return `<div class="${cls}" style="left:${left}%;width:${w}%;${bg}" title="${sg.label}">${sg.label}</div>`;
+  }).join('');
+  const marks = (lane.marks||[]).map(m=>{
+    const glyph = m.kind==='deadline'?'▼':m.kind==='cancel'?'✕':m.kind==='respond'?'◆':'●';
+    const op = m.faded?'opacity:.35;':'';
+    return `<div class="mk ${m.kind}" style="left:${pct(m.t)}%;${op}"><span class="glyph">${glyph}</span></div>`;
+  }).join('');
+  return `<div class="lane">
+    <div class="lane-name">${lane.name}<small>${lane.note||''}</small></div>
+    <div class="track">${segs}${marks}</div>
+  </div>`;
+}
+
+function cardHTML(s){
+  const axis = `<div class="axis">`+
+    ticks.map(t=>`<span class="tick" style="left:${pct(t)}%">${t}ms</span>`).join('')+
+    `</div>`;
+  const lanes = s.lanes.map(laneHTML).join('');
+  const events = `<div class="events"><ul>`+
+    s.events.map(e=>`<li><span class="t">${e.t}</span><span class="g" style="color:var(--${e.gc})">${e.g}</span><span>${e.x}</span></li>`).join('')+
+    `</ul></div>`;
+  const badge = s.badge?`<span class="badge ${s.badge.cls}">${s.badge.text}</span>`:'';
+  return `<section class="card">
+    <h2>${s.title}${badge}</h2>
+    <p class="sub">${s.sub}</p>
+    <div class="chart">${axis}${lanes}</div>
+    ${events}
+    <p class="note">${s.note}</p>
+  </section>`;
+}
+
+root.innerHTML = scenarios.map(cardHTML).join('') + `
+  <div class="takeaway">
+    <h2>まとめ</h2>
+    <p>・<b>親→子は伝播、子→親は非伝播</b>。だから子(ES)の打ち切りで親(サーバー)を生かす=フォールバックが自然に書ける。</p>
+    <p>・打ち切りは常に <b>min(親の残予算, ES個別予算)</b>。ES が遅くてもパターン1とパターン2で結果は同じ。</p>
+    <p>・パターン2は ctx.Deadline() が独立予算のままで<b>ズレる</b>分、実クライアント向けにはパターン1(派生)が素直。</p>
+    <p>・原因は <b>ErrBudgetExceeded / DeadlineExceeded / Canceled</b> を errors.Is で見分け、Canceled(強制cancel)ではフォールバックしない。</p>
+  </div>`;
+</script>
+</body>
+</html>
