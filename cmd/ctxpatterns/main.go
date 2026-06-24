@@ -1,22 +1,23 @@
 // Command ctxpatterns は、検討中の 2 つの context 設計パターンを、サーバーや
 // Elasticsearch を使わずに動かして比較するための実験プログラムです。
 //
+// 設計方針: ES 個別の timeout context は「呼び出し側」ではなく「ES クライアント
+// (internal/esfake) の中」で作り、cancel もその中で defer します。呼び出し側は
+// サーバーのリクエスト context（親）を渡すだけなので、defer cancel の書き忘れによる
+// context リークが起きません。
+//
 // パターン1 (親子・派生):
 //
-//	サーバー context（親）から ES 用 context（子）を派生させる。子(ES)の timeout が
-//	切れても、親(サーバー)は生かしてフォールバック処理や部分応答を続けたい、という形。
+//	esfake.Client.Search が parent から ES 用 context を派生させる。子(ES)の timeout が
+//	切れても、親(サーバー)は生かしてフォールバックや部分応答を続けたい、という形。
 //
 // パターン2 (並列・独立 + 一方向伝播):
 //
-//	サーバー context と ES context を「並列に（独立して）」作り、サーバー(親)の
-//	timeout『だけ』を子(ES)へ一方向に伝播させる形。ES 側の打ち切りは親に影響しない。
+//	esfake.Client.SearchWithServerPropagation が ES context を Background から独立に作り、
+//	サーバー(親)の timeout『だけ』を子(ES)へ一方向に伝播させる形。
 //
-// 結論の先取り:
-//   - 実行時のキャンセル挙動だけ見ると、パターン2はパターン1（派生）と同じ結果に
-//     なります。パターン2は派生で自動的に得られる「親→子の伝播」を手作業で組み直して
-//     いるだけなので、特別な理由が無ければパターン1（派生）を勧めます。
-//   - パターン2が本当に要るのは「子の deadline を親より長くしたい / 親より独立に
-//     管理したいが、親が死んだら子も止めたい」といった、派生では表現しづらいケース。
+// 結論の先取り: 実行時のキャンセル挙動はパターン2もパターン1と同じ結果になります。
+// 特別な理由が無ければ、自動で親→子伝播が効くパターン1（派生）を勧めます。
 //
 // 実行: go run ./cmd/ctxpatterns
 package main
@@ -45,30 +46,27 @@ func main() {
 // pattern1ChildTimesOutParentSurvives は、子(ES)の timeout が切れても親(サーバー)を
 // 生かして後続処理を続ける、という狙い通りに動くことを示します。
 //
-//	serverCtx (500ms) ─派生→ esCtx (100ms)
-//	ES 処理は 300ms かかる想定 → esCtx が先に切れる。serverCtx はまだ生きている。
+//	serverCtx (500ms) を client.Search に渡すと、内部で ES 個別 timeout(100ms) を派生。
+//	ES 応答は 300ms かかる想定 → ES 個別予算が先に切れる。serverCtx はまだ生きている。
 func pattern1ChildTimesOutParentSurvives() {
 	section("パターン1: 子(ES)が timeout → 親(サーバー)は生存しフォールバック")
 
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancelServer()
 
-	// ES 呼び出し直前に、サーバー context を親にして個別 timeout を派生。
-	esCtx, cancelES := context.WithTimeout(serverCtx, 100*time.Millisecond)
-	defer cancelES()
-
-	_, err := esfake.Search(esCtx, "primary", 300*time.Millisecond)
+	// ES 個別 timeout=100ms / 応答 latency=300ms。
+	// 呼び出し側は serverCtx を渡すだけ。esCtx と defer cancel は client 内部。
+	client := esfake.New(100*time.Millisecond, 300*time.Millisecond)
+	_, err := client.Search(serverCtx, "primary")
 	report("ES(primary)", err)
 
-	// ここがパターン1の肝: ES がコケても親 context の Err を見て分岐する。
-	if errors.Is(err, context.DeadlineExceeded) && serverCtx.Err() == nil {
+	// パターン1の肝: ES がコケても親 context の状態を見て分岐する。
+	if errors.Is(err, esfake.ErrBudgetExceeded) && serverCtx.Err() == nil {
 		fmt.Println("    -> ES はタイムアウトしたが serverCtx は生存。フォールバックに進む。")
 
-		// 親 context にはまだ予算が残っているので、後続処理（軽い再検索や
-		// キャッシュ参照、部分応答の組み立て）を続けられる。
-		fbCtx, cancelFB := context.WithTimeout(serverCtx, 100*time.Millisecond)
-		defer cancelFB()
-		res, fbErr := esfake.Search(fbCtx, "fallback", 30*time.Millisecond)
+		// 親 context にはまだ予算が残っているので、軽いフォールバック検索を続けられる。
+		fast := esfake.New(100*time.Millisecond, 30*time.Millisecond)
+		res, fbErr := fast.Search(serverCtx, "fallback")
 		report("ES(fallback)", fbErr)
 		fmt.Printf("    クライアントへ返す結果: %q (degraded)\n", res)
 	}
@@ -77,17 +75,16 @@ func pattern1ChildTimesOutParentSurvives() {
 }
 
 // pattern1ParentTimesOut は、親(サーバー)の予算自体が尽きた場合は、派生した子も
-// 巻き込まれて止まる（＝リクエスト全体を諦める）ことを示します。フォールバックも
-// 同じ serverCtx 由来なので動けません。
+// 巻き込まれて止まる（＝リクエスト全体を諦める）ことを示します。
 func pattern1ParentTimesOut() {
 	section("パターン1: 親(サーバー)の予算が尽きた場合")
 
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancelServer()
-	esCtx, cancelES := context.WithTimeout(serverCtx, 500*time.Millisecond)
-	defer cancelES()
 
-	_, err := esfake.Search(esCtx, "primary", 300*time.Millisecond)
+	// ES 個別には余裕(500ms)を持たせても、親が 80ms で切れれば子も止まる。
+	client := esfake.New(500*time.Millisecond, 300*time.Millisecond)
+	_, err := client.Search(serverCtx, "primary")
 	report("ES(primary)", err)
 
 	if serverCtx.Err() != nil {
@@ -101,60 +98,21 @@ func pattern1ParentTimesOut() {
 // パターン2: 並列・独立 + 親→子の一方向伝播
 // ============================================================
 
-// errESBudget は ES 個別予算の超過を表す cause です。原因の読み分けに使います。
-var errESBudget = errors.New("es individual budget exceeded")
-
-// newESContextWithServerPropagation は、パターン2の中心となるヘルパです。
+// pattern2PropagateToChildOnly_ServerTimesOut は、ES クライアント内部で独立に作った
+// context へ、サーバーの timeout が一方向で伝播し ES が中断されることを示します。
 //
-//   - esCtx は serverCtx の「子」ではなく、Background から独立に作る（＝並列）。
-//   - esCtx には ES 個別の timeout を持たせる。
-//   - context.AfterFunc で serverCtx.Done() を監視し、サーバーが切れたら esCtx だけを
-//     キャンセルする（親→子の一方向伝播）。逆向き（子→親）は一切起きない。
-//
-// stop() は AfterFunc の登録を解除します（ES が先に終わったときの後始末用）。
-func newESContextWithServerPropagation(serverCtx context.Context, esBudget time.Duration) (
-	ctx context.Context, cancel context.CancelFunc, stop func() bool,
-) {
-	// 独立した root に cause 付き cancel を持たせる。
-	base, cancelCause := context.WithCancelCause(context.Background())
-
-	// ES 個別の timeout。超過時の cause は errESBudget。
-	esCtx, cancelTimer := context.WithTimeoutCause(base, esBudget, errESBudget)
-
-	// 親(サーバー)が切れたら esCtx だけをキャンセル。原因は serverCtx 側の cause を引き継ぐ。
-	stop = context.AfterFunc(serverCtx, func() {
-		cancelCause(fmt.Errorf("server context done: %w", context.Cause(serverCtx)))
-	})
-
-	// 呼び出し側に渡す後始末: タイマー解除 + cause cancel。
-	cancel = func() {
-		cancelTimer()
-		cancelCause(context.Canceled)
-	}
-	return esCtx, cancel, stop
-}
-
-// pattern2PropagateToChildOnly_ServerTimesOut は、独立に作った esCtx に対して
-// サーバー context の timeout が一方向で伝播し、ES 呼び出しが中断されることを示します。
-//
-//	serverCtx (80ms, 独立)
-//	esCtx     (500ms, 独立) ← AfterFunc で serverCtx.Done を受けて中断
-//	ES 処理は 300ms 想定 → サーバー(80ms)が先に切れ、その伝播で esCtx も切れる。
+//	serverCtx (80ms) を渡す。ES 個別予算は 500ms、応答 latency は 300ms。
+//	→ サーバー(80ms)が先に切れ、その伝播で ES も中断される。
 func pattern2PropagateToChildOnly_ServerTimesOut() {
 	section("パターン2: 独立 esCtx へサーバー timeout が一方向伝播（サーバーが先に切れる）")
 
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancelServer()
 
-	esCtx, cancelES, stop := newESContextWithServerPropagation(serverCtx, 500*time.Millisecond)
-	defer stop()
-	defer cancelES()
-
-	_, err := esfake.Search(esCtx, "es-parallel", 300*time.Millisecond)
+	client := esfake.New(500*time.Millisecond, 300*time.Millisecond)
+	_, err := client.SearchWithServerPropagation(serverCtx, "es-parallel")
 	report("ES", err)
-	// esCtx.Err() は WithCancelCause 由来なので Canceled。本当の原因は Cause で読む。
-	fmt.Printf("    esCtx.Err()=%v / context.Cause(esCtx)=%v\n", esCtx.Err(), context.Cause(esCtx))
-	fmt.Println("=> サーバーの timeout が esCtx に伝播して ES を中断。Cause からサーバー由来と分かる。")
+	fmt.Println("=> サーバーの timeout が ES に伝播して中断。エラーからサーバー由来と分かる。")
 }
 
 // pattern2PropagateToChildOnly_ESTimesOut は、逆に ES 個別予算が先に切れた場合、
@@ -165,22 +123,18 @@ func pattern2PropagateToChildOnly_ESTimesOut() {
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancelServer()
 
-	esCtx, cancelES, stop := newESContextWithServerPropagation(serverCtx, 80*time.Millisecond)
-	defer stop()
-	defer cancelES()
-
-	_, err := esfake.Search(esCtx, "es-parallel", 300*time.Millisecond)
+	client := esfake.New(80*time.Millisecond, 300*time.Millisecond)
+	_, err := client.SearchWithServerPropagation(serverCtx, "es-parallel")
 	report("ES", err)
-	fmt.Printf("    context.Cause(esCtx)=%v (ES 個別予算の超過)\n", context.Cause(esCtx))
 	reportCtxState("serverCtx", serverCtx)
 	fmt.Println("=> ES の打ち切りは独立 root に閉じるのでサーバーは無傷。パターン1と同じ結果。")
 }
 
 // pattern2Parallel は「二つ並列でやらせる」イメージそのものを再現します。
 //
-// メイン goroutine はサーバー処理を進めつつ、ES 呼び出しを別 goroutine で並走させます。
-// サーバー context の timeout は両方に効きます（ES へは AfterFunc 経由）。ES が単独で
-// コケてもサーバー側の別処理は止まりません。
+// メイン goroutine はサーバー本体の処理を進めつつ、ES 呼び出しを別 goroutine で
+// 並走させます。サーバー context の timeout は両方に効きます（ES へは内部の AfterFunc
+// 経由）。ES が単独でコケてもサーバー側の別処理は止まりません。
 func pattern2Parallel() {
 	section("パターン2: 二つ並列（ES を別 goroutine で並走、サーバー timeout が両方に効く）")
 
@@ -193,12 +147,10 @@ func pattern2Parallel() {
 	}
 	esDone := make(chan esResult, 1)
 
-	// 並走その1: ES 呼び出し（独立 ctx + サーバー伝播）。
+	// 並走その1: ES 呼び出し（独立 ctx + サーバー伝播は client 内部に隠蔽）。
 	go func() {
-		esCtx, cancelES, stop := newESContextWithServerPropagation(serverCtx, 150*time.Millisecond)
-		defer stop()
-		defer cancelES()
-		body, err := esfake.Search(esCtx, "parallel-es", 100*time.Millisecond)
+		client := esfake.New(150*time.Millisecond, 100*time.Millisecond)
+		body, err := client.SearchWithServerPropagation(serverCtx, "parallel-es")
 		esDone <- esResult{body, err}
 	}()
 
@@ -231,10 +183,10 @@ func report(label string, err error) {
 	switch {
 	case err == nil:
 		fmt.Printf("    %s: 成功\n", label)
-	case errors.Is(err, errESBudget):
+	case errors.Is(err, esfake.ErrBudgetExceeded):
 		fmt.Printf("    %s: ES 個別予算超過 -> %v\n", label, err)
 	case errors.Is(err, context.DeadlineExceeded):
-		fmt.Printf("    %s: DeadlineExceeded -> %v\n", label, err)
+		fmt.Printf("    %s: DeadlineExceeded(サーバー由来) -> %v\n", label, err)
 	case errors.Is(err, context.Canceled):
 		fmt.Printf("    %s: Canceled -> %v\n", label, err)
 	default:

@@ -5,42 +5,66 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/rirua/go_ctx/internal/esfake"
 )
 
-// TestPropagation_ServerCancelReachesChild は、サーバー context が切れると
-// 独立に作った esCtx へ一方向で伝播することを検証します。
-func TestPropagation_ServerCancelReachesChild(t *testing.T) {
-	serverCtx, cancelServer := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancelServer()
-
-	esCtx, cancelES, stop := newESContextWithServerPropagation(serverCtx, 500*time.Millisecond)
-	defer stop()
-	defer cancelES()
-
-	select {
-	case <-esCtx.Done():
-		// サーバー由来の cause が伝わっているはず。
-		if !errors.Is(context.Cause(esCtx), context.DeadlineExceeded) {
-			t.Fatalf("サーバー由来の DeadlineExceeded を期待したが: %v", context.Cause(esCtx))
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("サーバー timeout が esCtx に伝播しなかった")
-	}
-}
-
-// TestPropagation_ChildDoesNotReachServer は、ES 個別予算が切れても
-// サーバー context は影響を受けない（子→親は伝播しない）ことを検証します。
-func TestPropagation_ChildDoesNotReachServer(t *testing.T) {
+// TestPattern1_ChildTimeoutDoesNotKillParent は、ES 個別予算が切れても親(サーバー)が
+// 生存することを検証します（パターン1）。
+func TestPattern1_ChildTimeoutDoesNotKillParent(t *testing.T) {
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancelServer()
 
-	esCtx, cancelES, stop := newESContextWithServerPropagation(serverCtx, 30*time.Millisecond)
-	defer stop()
-	defer cancelES()
+	client := esfake.New(30*time.Millisecond, 300*time.Millisecond) // 個別30ms / 応答300ms
+	_, err := client.Search(serverCtx, "q")
+	if !errors.Is(err, esfake.ErrBudgetExceeded) {
+		t.Fatalf("ES 個別予算超過を期待したが: %v", err)
+	}
+	if serverCtx.Err() != nil {
+		t.Fatalf("親(サーバー)は生きているはず: %v", serverCtx.Err())
+	}
+}
 
-	<-esCtx.Done()
-	if !errors.Is(context.Cause(esCtx), errESBudget) {
-		t.Fatalf("ES 個別予算超過を期待したが: %v", context.Cause(esCtx))
+// TestPattern1_ParentTimeoutPropagatesToChild は、親(サーバー)が切れると派生した子も
+// 止まることを検証します（親→子は伝播）。
+func TestPattern1_ParentTimeoutPropagatesToChild(t *testing.T) {
+	serverCtx, cancelServer := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelServer()
+
+	client := esfake.New(500*time.Millisecond, 300*time.Millisecond) // 個別は余裕
+	_, err := client.Search(serverCtx, "q")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("親由来の DeadlineExceeded を期待したが: %v", err)
+	}
+	if errors.Is(err, esfake.ErrBudgetExceeded) {
+		t.Fatalf("ES 個別予算ではなく親の deadline が原因のはず: %v", err)
+	}
+}
+
+// TestPattern2_ServerTimeoutReachesChild は、独立に作った ES context へサーバーの
+// timeout が一方向で伝播することを検証します（パターン2）。
+func TestPattern2_ServerTimeoutReachesChild(t *testing.T) {
+	serverCtx, cancelServer := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelServer()
+
+	client := esfake.New(500*time.Millisecond, 300*time.Millisecond) // 個別は余裕
+	_, err := client.SearchWithServerPropagation(serverCtx, "q")
+	// 伝播 cause はサーバーの deadline を %w で包んでいるので errors.Is が通る。
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("サーバー由来の DeadlineExceeded を期待したが: %v", err)
+	}
+}
+
+// TestPattern2_ChildTimeoutDoesNotReachServer は、ES 個別予算が切れても
+// サーバー context は無傷であることを検証します（子→親は非伝播）。
+func TestPattern2_ChildTimeoutDoesNotReachServer(t *testing.T) {
+	serverCtx, cancelServer := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelServer()
+
+	client := esfake.New(30*time.Millisecond, 300*time.Millisecond) // 個別30ms
+	_, err := client.SearchWithServerPropagation(serverCtx, "q")
+	if !errors.Is(err, esfake.ErrBudgetExceeded) {
+		t.Fatalf("ES 個別予算超過を期待したが: %v", err)
 	}
 	if serverCtx.Err() != nil {
 		t.Fatalf("サーバーは無傷のはず: %v", serverCtx.Err())
