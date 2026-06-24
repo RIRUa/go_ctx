@@ -37,6 +37,7 @@ func main() {
 	pattern2PropagateToChildOnly_ServerTimesOut()
 	pattern2PropagateToChildOnly_ESTimesOut()
 	pattern2Parallel()
+	forcedCancelPropagation()
 }
 
 // ============================================================
@@ -169,6 +170,70 @@ func pattern2Parallel() {
 		fmt.Printf("    サーバー予算切れ (%v) → ES 結果を待たずに応答\n", context.Cause(serverCtx))
 	}
 	fmt.Println("=> 並列でもサーバー timeout は両方に届く。ES 単独の失敗はサーバーの別処理を止めない。")
+}
+
+// ============================================================
+// 補足: deadline ではなく強制 cancel された場合
+// ============================================================
+
+// forcedCancelPropagation は、deadline 超過ではなく ctx が「強制的に cancel された」
+// 場合（クライアント切断・サーバーの graceful shutdown など。実 Echo/net.http は
+// クライアント切断時にリクエスト context を cancel する）の挙動を示します。
+//
+// ポイント:
+//   - 強制 cancel も deadline と同じく親→子へ伝播する（両パターンとも）。
+//   - ただし原因は context.Canceled になり、DeadlineExceeded や ErrBudgetExceeded と
+//     errors.Is で区別できる。
+//   - Canceled のときは「もう誰も結果を待っていない」ので、フォールバックを走らせず
+//     即座に処理を畳むのが正解（フォールバックすると無駄なリソースを使う）。
+func forcedCancelPropagation() {
+	section("補足: ctx が強制 cancel された場合（クライアント切断 / サーバー停止）")
+
+	// --- パターン1（派生）---
+	{
+		// 予算は十分(5s)に取るが、50ms 後に「クライアント切断」を模して強制 cancel する。
+		serverCtx, cancelServer := context.WithCancel(context.Background())
+		defer cancelServer()
+		go func() { time.Sleep(50 * time.Millisecond); cancelServer() }()
+
+		client := esfake.New(500*time.Millisecond, 300*time.Millisecond)
+		_, err := client.Search(serverCtx, "q")
+		report("パターン1 ES", err)
+		handleAfterCall(err, serverCtx)
+	}
+
+	// --- パターン2（独立 + サーバー伝播）---
+	{
+		serverCtx, cancelServer := context.WithCancel(context.Background())
+		defer cancelServer()
+		go func() { time.Sleep(50 * time.Millisecond); cancelServer() }()
+
+		client := esfake.New(500*time.Millisecond, 300*time.Millisecond)
+		_, err := client.SearchWithServerPropagation(serverCtx, "q")
+		report("パターン2 ES", err)
+		handleAfterCall(err, serverCtx)
+	}
+
+	fmt.Println("=> 強制 cancel も両パターンで子に伝播。原因は Canceled なので timeout と区別でき、")
+	fmt.Println("   『クライアントが去ったらフォールバックしない』という判断ができる。")
+}
+
+// handleAfterCall は、ES 呼び出し後にエラーの原因で処理を分岐する実用例です。
+func handleAfterCall(err error, serverCtx context.Context) {
+	switch {
+	case err == nil:
+		fmt.Println("      -> 成功。通常応答。")
+	case errors.Is(err, context.Canceled):
+		// クライアント切断 / サーバー停止。誰も待っていないのでフォールバックしない。
+		fmt.Println("      -> Canceled: クライアント切断/停止。フォールバックせず即終了。")
+	case errors.Is(err, esfake.ErrBudgetExceeded) && serverCtx.Err() == nil:
+		// ES だけ遅い。サーバーは生存しているのでフォールバック可。
+		fmt.Println("      -> ES個別予算超過 & サーバー生存: フォールバックに進める。")
+	case errors.Is(err, context.DeadlineExceeded):
+		fmt.Println("      -> サーバー予算切れ: クライアントへタイムアウト応答。")
+	default:
+		fmt.Printf("      -> その他: %v\n", err)
+	}
 }
 
 // ============================================================
